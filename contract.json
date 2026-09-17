@@ -1,0 +1,20 @@
+{
+  "schema_version": "book-platform.contract.v1",
+  "platform_id": "api-gateway",
+  "repository": "book-api-gateway",
+  "status": "pilot",
+  "api_version": "v1",
+  "data_owner": "none",
+  "capabilities": ["routing", "request-id", "rate-limit", "ingress-policy"],
+  "depends_on": ["identity"],
+  "current_implementation": {
+    "repository": "solo-empire",
+    "source_path": "infra/api/server.ts"
+  },
+  "migration": {
+    "compatibility_adapter": "local HTTP adapter only",
+    "shadow_parity": "pending: compare infra/api/server.ts responses",
+    "cutover": "pending",
+    "rollback": "required"
+  }
+}
