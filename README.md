@@ -43,6 +43,14 @@ GitHub Actions runs the same command on every push and pull request
 It uses only loopback fixtures and does not claim deployment, provider
 connectivity, data migration, or production readiness.
 
+`scripts/check_schema_pin.py` fails when the vendored schema no longer
+matches the sha256 pinned in `schema/book-platform.contract.v1.schema.json.sha256`
+(the canonical copy lives in `bookchaowalit-backend-core/contracts/`; change it
+there first, then copy the schema and its pin here). Pass
+`--canonical ../bookchaowalit-backend-core` to also compare with a local
+checkout. `python3 scripts/check_registry_alignment.py --solo-empire ../solo-empire`
+compares this contract with the parent platform registry (local only; read-only).
+
 The pilot exposes `GET /healthz` and authenticated `GET`/`POST /api/*` routes.
 Set `BOOK_API_GATEWAY_TOKEN`, `UPSTREAM_BASE_URL`, and (when the upstream is
 not loopback) `UPSTREAM_ALLOWED_HOSTS` before starting

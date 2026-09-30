@@ -24,8 +24,9 @@ local pilot token, has one upstream, and has no shadow-parity evidence against
   `UPSTREAM_BASE_URL`, with a versioned route contract (registry gate).
 - The remaining ~4 s of the suite is `raw_exchange` sleeping for socket
   reads; read until the response is complete instead of fixed waits.
-- Keep `schema/book-platform.contract.v1.schema.json` identical to
-  `bookchaowalit-backend-core/contracts/`.
+- Replace the vendored schema and its pin with a reusable workflow or tagged
+  package from `bookchaowalit-backend-core` once one exists (the pin check
+  already fails on drift).
 
 ### P2
 
@@ -45,6 +46,17 @@ local pilot token, has one upstream, and has no shadow-parity evidence against
   8 new tests (readiness, probe, limiter bounds). Offline only.
 - P0 items (identity subject assertion, shadow-parity fixtures) remain blocked
   on `book-identity-platform` and sanitized `solo-empire` captures.
+- Schema pin: `schema/book-platform.contract.v1.schema.json.sha256` pins the
+  canonical digest; `scripts/check_schema_pin.py` fails on drift (and, with
+  `--canonical`, compares with a local backend-core checkout). It runs in
+  `scripts/check.sh` and as its own CI step.
+- `scripts/check_registry_alignment.py --solo-empire PATH` compares the
+  contract with `repository-catalog/registries/platforms.yaml` (local,
+  read-only; not in CI). Interface sources that exist in this repository are
+  skipped instead of reported as missing solo-empire paths.
+- `tests/test_drift_checks.py` covers both checks offline. Verified against
+  `solo-empire` `5b43c85` (no drift, no warnings) and
+  `bookchaowalit-backend-core/scripts/check_platform_sync.py --require-pin`.
 
 ## Done in pass 1
 
