@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import socket
 import sys
 import threading
 import time
@@ -91,6 +92,25 @@ def call(url: str, *, method: str = "GET", headers: dict[str, str] | None = None
             return error.code, dict(error.headers), json.loads(error.read().decode("utf-8"))
         finally:
             error.close()
+
+
+def raw_exchange(port: int, payload: bytes, *, wait: float = 0.3) -> bytes:
+    """Send raw bytes on one connection and return everything the gateway writes."""
+
+    with socket.create_connection(("127.0.0.1", port), timeout=1.0) as connection:
+        connection.sendall(payload)
+        time.sleep(wait)
+        connection.settimeout(0.5)
+        chunks: list[bytes] = []
+        try:
+            while True:
+                chunk = connection.recv(65536)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+        except socket.timeout:
+            pass
+    return b"".join(chunks)
 
 
 class GatewayTests(unittest.TestCase):
@@ -230,6 +250,11 @@ class GatewayTests(unittest.TestCase):
         )
 
         self.assertEqual(status, 200)
+        # Telemetry is emitted after the response is flushed, so the client can
+        # observe the response first; wait briefly instead of racing the handler.
+        deadline = time.monotonic() + 2.0
+        while not self.telemetry and time.monotonic() < deadline:
+            time.sleep(0.01)
         self.assertTrue(self.telemetry)
         event = self.telemetry[-1]
         self.assertEqual(event["event"], "request.completed")
@@ -239,6 +264,79 @@ class GatewayTests(unittest.TestCase):
         rendered = json.dumps(self.telemetry)
         self.assertNotIn(self.token, rendered)
         self.assertNotIn(body.decode(), rendered)
+
+    def test_dot_segments_and_backslashes_cannot_escape_the_api_prefix(self) -> None:
+        self.start_gateway()
+        port = self.gateway.server_port
+        for target in ("/api/../admin", "/api/demo/%2e%2e/%2E%2E/admin", "/api/./demo", "/api/demo\\..\\admin", "/api/demo%5c..%5cadmin"):
+            with self.subTest(target=target):
+                response = raw_exchange(
+                    port,
+                    f"GET {target} HTTP/1.1\r\nHost: gateway\r\nAuthorization: Bearer {self.token}\r\nConnection: close\r\n\r\n".encode(),
+                )
+                self.assertTrue(response.startswith(b"HTTP/1.1 400 "), response[:80])
+                self.assertIn(b"invalid request path", response)
+        self.assertEqual(RecordingUpstreamHandler.records, [])
+
+    def test_rejected_request_body_is_not_parsed_as_a_second_request(self) -> None:
+        self.start_gateway()
+        smuggled = b"GET /healthz HTTP/1.1\r\nHost: gateway\r\n\r\n"
+        response = raw_exchange(
+            self.gateway.server_port,
+            b"POST /api/demo HTTP/1.1\r\nHost: gateway\r\nContent-Length: "
+            + str(len(smuggled)).encode()
+            + b"\r\n\r\n"
+            + smuggled,
+        )
+
+        self.assertEqual(response.count(b"HTTP/1.1 "), 1, response)
+        self.assertTrue(response.startswith(b"HTTP/1.1 401 "))
+        self.assertIn(b"Connection: close", response)
+
+    def test_chunked_request_bodies_are_rejected_without_proxying(self) -> None:
+        self.start_gateway()
+        response = raw_exchange(
+            self.gateway.server_port,
+            (
+                "POST /api/demo HTTP/1.1\r\nHost: gateway\r\n"
+                f"Authorization: Bearer {self.token}\r\nTransfer-Encoding: chunked\r\n\r\n"
+                "5\r\nhello\r\n0\r\n\r\n"
+            ).encode(),
+        )
+
+        self.assertEqual(response.count(b"HTTP/1.1 "), 1, response)
+        self.assertTrue(response.startswith(b"HTTP/1.1 411 "))
+        self.assertEqual(RecordingUpstreamHandler.records, [])
+
+    def test_ambiguous_content_length_is_rejected(self) -> None:
+        self.start_gateway()
+        for headers in ("Content-Length: 1\r\nContent-Length: 2\r\n", "Content-Length: +1\r\n"):
+            with self.subTest(headers=headers):
+                response = raw_exchange(
+                    self.gateway.server_port,
+                    (
+                        "POST /api/demo HTTP/1.1\r\nHost: gateway\r\n"
+                        f"Authorization: Bearer {self.token}\r\n{headers}\r\nxx"
+                    ).encode(),
+                )
+                self.assertTrue(response.startswith(b"HTTP/1.1 400 "), response[:80])
+                self.assertIn(b"invalid content length", response)
+        self.assertEqual(RecordingUpstreamHandler.records, [])
+
+    def test_successful_requests_keep_the_connection_reusable(self) -> None:
+        self.start_gateway()
+        request = f"GET /api/demo HTTP/1.1\r\nHost: gateway\r\nAuthorization: Bearer {self.token}\r\n\r\n".encode()
+        response = raw_exchange(self.gateway.server_port, request + request)
+
+        self.assertEqual(response.count(b"HTTP/1.1 200 "), 2, response)
+        self.assertEqual(len(RecordingUpstreamHandler.records), 2)
+
+    def test_server_header_does_not_disclose_runtime_version(self) -> None:
+        base_url = self.start_gateway()
+        _status, headers, _payload = call(f"{base_url}/healthz")
+
+        self.assertEqual(headers["Server"], "book-api-gateway")
+        self.assertNotIn("Python", json.dumps(headers))
 
     def test_upstream_base_url_rejects_credentials_and_non_allowlisted_hosts(self) -> None:
         with self.assertRaises(ConfigError):

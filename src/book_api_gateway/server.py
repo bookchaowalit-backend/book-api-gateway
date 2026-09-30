@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from .config import GatewayConfig
@@ -24,6 +24,7 @@ from .limiter import FixedWindowRateLimiter
 
 
 REQUEST_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
+CONTENT_LENGTH_RE = re.compile(r"[0-9]{1,19}")
 FORWARD_HEADERS = ("Accept", "Content-Type", "If-Match", "If-None-Match")
 ALLOWED_METHODS = frozenset({"GET", "POST"})
 TelemetrySink = Callable[[dict[str, Any]], None]
@@ -34,6 +35,23 @@ class _NoRedirectHandler(HTTPRedirectHandler):
 
     def redirect_request(self, *_args: Any, **_kwargs: Any):
         return None
+
+
+def _unsafe_api_path(path: str) -> bool:
+    """Return True when a path could escape the ``/api/`` prefix upstream.
+
+    Upstream servers and intermediaries commonly normalise dot segments and
+    backslashes, so ``/api/../admin`` or ``/api/%2e%2e/admin`` would otherwise
+    reach a route outside the gateway's allow-listed prefix.
+    """
+
+    if "\\" in path or "%5c" in path.casefold():
+        return True
+    decoded = unquote(path)
+    if "\\" in decoded or any(ord(char) < 0x20 or ord(char) == 0x7F for char in decoded):
+        return True
+    segments = decoded.split("/")[1:]
+    return any(segment in {".", ".."} for segment in segments)
 
 
 def _default_telemetry(event: dict[str, Any]) -> None:
@@ -69,6 +87,11 @@ class GatewayRequestHandler(BaseHTTPRequestHandler):
     """Authenticate, limit, and proxy the small versioned API surface."""
 
     protocol_version = "HTTP/1.1"
+    server_version = "book-api-gateway"
+
+    def version_string(self) -> str:
+        # Do not advertise the Python runtime version to clients.
+        return self.server_version
 
     @property
     def state(self) -> GatewayState:
@@ -102,6 +125,10 @@ class GatewayRequestHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(payload)))
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Request-ID", request_id)
+        if self._body_pending():
+            # The declared request body was not read, so the remaining bytes on
+            # this connection cannot be trusted as the next request.
+            self.send_header("Connection", "close")
         for name, value in (extra_headers or {}).items():
             if any(ord(char) < 0x20 or ord(char) == 0x7F for char in value):
                 continue
@@ -113,6 +140,13 @@ class GatewayRequestHandler(BaseHTTPRequestHandler):
             except BrokenPipeError:
                 pass
         return status
+
+    def _body_pending(self) -> bool:
+        if getattr(self, "_body_consumed", False):
+            return False
+        if self.headers.get("Transfer-Encoding") is not None:
+            return True
+        return self.headers.get("Content-Length", "0").strip() not in {"", "0"}
 
     def _send_json(
         self,
@@ -181,6 +215,8 @@ class GatewayRequestHandler(BaseHTTPRequestHandler):
 
         if not path.startswith("/api/") or path == "/api/":
             return self._error(404, "route not found", request_id)
+        if _unsafe_api_path(path):
+            return self._error(400, "invalid request path", request_id)
         if self.command not in ALLOWED_METHODS:
             return self._error(405, "method not allowed", request_id, extra_headers={"Allow": "GET, POST"})
 
@@ -197,16 +233,19 @@ class GatewayRequestHandler(BaseHTTPRequestHandler):
                 extra_headers={"Retry-After": str(retry_after)},
             )
 
-        raw_length = self.headers.get("Content-Length", "0")
-        try:
-            length = int(raw_length)
-        except ValueError:
+        if self.headers.get("Transfer-Encoding") is not None:
+            return self._error(411, "chunked request bodies are not supported", request_id)
+        raw_lengths = {value.strip() for value in self.headers.get_all("Content-Length", [])}
+        if len(raw_lengths) > 1:
             return self._error(400, "invalid content length", request_id)
-        if length < 0:
+        raw_length = raw_lengths.pop() if raw_lengths else "0"
+        if not CONTENT_LENGTH_RE.fullmatch(raw_length):
             return self._error(400, "invalid content length", request_id)
+        length = int(raw_length)
         if length > self.state.config.max_body_bytes:
             return self._error(413, "request body too large", request_id)
         body = self.rfile.read(length) if length else b""
+        self._body_consumed = True
         if len(body) != length:
             return self._error(400, "incomplete request body", request_id)
         return self._proxy(path, body, request_id, subject_hash)
@@ -260,6 +299,7 @@ class GatewayRequestHandler(BaseHTTPRequestHandler):
         request_id = self._request_id()
         self._last_status = 500
         self._subject_hash: str | None = None
+        self._body_consumed = False
         try:
             self._dispatch(request_id)
         except Exception:
