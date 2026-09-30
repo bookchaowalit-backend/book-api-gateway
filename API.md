@@ -7,11 +7,16 @@ machine-readable interface list is `interfaces` in [`contract.json`](contract.js
 | ID | Method | Path | Authentication | Downstream behavior |
 |---|---|---|---|---|
 | `api-gateway.http.healthz` | `GET` | `/healthz` | Public | No upstream call; reports process health |
-| `api-gateway.http.readyz` | `GET` | `/readyz` | Public | No upstream call; reports pilot readiness |
+| `api-gateway.http.readyz` | `GET` | `/readyz` | Public | TCP connect to the upstream (no HTTP request); 503 when not ready |
 | `api-gateway.http.proxy` | `GET`, `POST` | `/api/*` | `Authorization: Bearer <configured token>` | Proxies to the configured, allow-listed upstream |
 
-The health payload is `{"contract": "book-api-gateway.v1", "status": "ok",
-"auth_configured": <bool>}`. Other methods on the health routes return 405.
+`/healthz` is liveness only and always returns 200 with
+`{"contract": "book-api-gateway.v1", "status": "ok", "auth_configured": <bool>}`.
+`/readyz` adds `"upstream_reachable": <bool>` and returns 200 with
+`"status": "ok"` only when a gateway token is configured and a TCP connection
+to the upstream host and port succeeds within `min(UPSTREAM_TIMEOUT_SECONDS, 1)`
+seconds; otherwise 503 with `"status": "not_ready"`. The upstream address is
+never included. Other methods on these routes return 405.
 
 The gateway does not own domain objects or make object-level authorization
 decisions. The downstream platform remains responsible for tenant, role and
@@ -22,7 +27,8 @@ the identity platform is the dependency for a production subject assertion
 ## Request handling
 
 Every `/api/*` request receives a validated `X-Request-ID`, is rate-limited per
-authenticated subject, and forwards only `Accept`, `Content-Type`, conditional
+authenticated subject (at most 10,000 tracked windows; expired then oldest
+windows are evicted first), and forwards only `Accept`, `Content-Type`, conditional
 request headers, `X-Request-ID` and a hashed subject marker
 (`X-Authenticated-Subject`) to the upstream (`api-gateway.http.upstream`). The
 original `Authorization` header is never forwarded. Query parameters are

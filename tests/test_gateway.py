@@ -16,7 +16,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from book_api_gateway.config import ConfigError, GatewayConfig  # noqa: E402
-from book_api_gateway.server import create_server  # noqa: E402
+from book_api_gateway.limiter import FixedWindowRateLimiter  # noqa: E402
+from book_api_gateway.server import create_server, upstream_tcp_probe  # noqa: E402
 
 
 class RecordingUpstreamHandler(BaseHTTPRequestHandler):
@@ -77,7 +78,9 @@ class RecordingUpstreamHandler(BaseHTTPRequestHandler):
 
 
 def start_server(server: ThreadingHTTPServer) -> threading.Thread:
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    # A short poll interval keeps shutdown() fast; the default 0.5 s poll made
+    # teardown dominate the suite.
+    thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.02}, daemon=True)
     thread.start()
     return thread
 
@@ -141,6 +144,40 @@ class GatewayTests(unittest.TestCase):
         self.gateway = create_server(config, telemetry_sink=self.telemetry.append)
         start_server(self.gateway)
         return f"http://127.0.0.1:{self.gateway.server_port}"
+
+    def test_readyz_reports_ready_when_upstream_reachable(self) -> None:
+        base_url = self.start_gateway()
+        status, _headers, payload = call(f"{base_url}/readyz")
+
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["status"], "ok")
+        self.assertTrue(payload["upstream_reachable"])
+        self.assertEqual(RecordingUpstreamHandler.records, [], "readiness must not send upstream HTTP requests")
+
+    def test_readyz_is_503_when_upstream_down_but_healthz_stays_200(self) -> None:
+        base_url = self.start_gateway()
+        self.upstream.shutdown()
+        self.upstream.server_close()
+
+        status, _headers, payload = call(f"{base_url}/readyz")
+        self.assertEqual(status, 503)
+        self.assertEqual(payload["status"], "not_ready")
+        self.assertFalse(payload["upstream_reachable"])
+        self.assertNotIn("127.0.0.1", json.dumps(payload), "upstream address must not be disclosed")
+
+        health_status, _headers, _payload = call(f"{base_url}/healthz")
+        self.assertEqual(health_status, 200)
+
+    def test_readyz_is_503_without_token(self) -> None:
+        config = GatewayConfig(
+            api_token="",
+            upstream_base_url=f"http://127.0.0.1:{self.upstream.server_port}",
+        )
+        self.gateway = create_server(config, telemetry_sink=self.telemetry.append)
+        start_server(self.gateway)
+        status, _headers, payload = call(f"http://127.0.0.1:{self.gateway.server_port}/readyz")
+        self.assertEqual(status, 503)
+        self.assertFalse(payload["auth_configured"])
 
     def test_health_is_public_and_sets_request_id(self) -> None:
         base_url = self.start_gateway()
@@ -347,3 +384,44 @@ class GatewayTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class UpstreamProbeTests(unittest.TestCase):
+    def test_closed_port_is_unreachable(self) -> None:
+        with socket.socket() as sock:
+            sock.bind(("127.0.0.1", 0))
+            port = sock.getsockname()[1]
+        self.assertFalse(upstream_tcp_probe(f"http://127.0.0.1:{port}", 0.2))
+
+    def test_listening_port_is_reachable(self) -> None:
+        with socket.socket() as sock:
+            sock.bind(("127.0.0.1", 0))
+            sock.listen()
+            self.assertTrue(upstream_tcp_probe(f"http://127.0.0.1:{sock.getsockname()[1]}", 0.2))
+
+
+class LimiterBoundTests(unittest.TestCase):
+    def test_expired_windows_are_evicted(self) -> None:
+        now = [0.0]
+        limiter = FixedWindowRateLimiter(1, window_seconds=10, clock=lambda: now[0], max_keys=3)
+        for key in ("a", "b", "c"):
+            limiter.allow(key)
+        now[0] = 11.0
+        limiter.allow("d")
+        self.assertEqual(len(limiter), 1)
+
+    def test_active_windows_are_capped_oldest_first(self) -> None:
+        now = [0.0]
+        limiter = FixedWindowRateLimiter(1, window_seconds=60, clock=lambda: now[0], max_keys=2)
+        for key in ("a", "b", "c"):
+            now[0] += 1
+            self.assertTrue(limiter.allow(key)[0])
+        self.assertEqual(len(limiter), 2)
+        # "a" was evicted, so its count restarts; "c" is still limited.
+        self.assertTrue(limiter.allow("a")[0])
+        self.assertFalse(limiter.allow("c")[0])
+
+    def test_rejects_non_positive_bound(self) -> None:
+        with self.assertRaises(ValueError):
+            FixedWindowRateLimiter(1, max_keys=0)
+

@@ -60,16 +60,37 @@ def _default_telemetry(event: dict[str, Any]) -> None:
     print(json.dumps(event, separators=(",", ":"), sort_keys=True), file=sys.stderr, flush=True)
 
 
+def upstream_tcp_probe(base_url: str, timeout_seconds: float) -> bool:
+    """Return True when a TCP connection to the upstream host:port succeeds.
+
+    Only reachability is checked: no HTTP request is sent, so readiness probes
+    never create upstream traffic, credentials or telemetry on the upstream.
+    """
+
+    parsed = urlsplit(base_url)
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    try:
+        with socket.create_connection((parsed.hostname or "", port), timeout=timeout_seconds):
+            return True
+    except (OSError, ValueError):
+        return False
+
+
 @dataclass
 class GatewayState:
     config: GatewayConfig
     limiter: FixedWindowRateLimiter
     telemetry_sink: TelemetrySink = _default_telemetry
     opener: Any = None
+    upstream_probe: Callable[[], bool] | None = None
 
     def __post_init__(self) -> None:
         if self.opener is None:
             self.opener = build_opener(_NoRedirectHandler())
+        if self.upstream_probe is None:
+            base_url = self.config.upstream_base_url
+            timeout = min(self.config.upstream_timeout_seconds, 1.0)
+            self.upstream_probe = lambda: upstream_tcp_probe(base_url, timeout)
 
 
 class GatewayHTTPServer(ThreadingHTTPServer):
@@ -206,12 +227,25 @@ class GatewayRequestHandler(BaseHTTPRequestHandler):
         if path in {"/healthz", "/readyz"}:
             if self.command != "GET":
                 return self._error(405, "method not allowed", request_id, extra_headers={"Allow": "GET"})
+            auth_configured = bool(self.state.config.api_token)
+            if path == "/healthz":
+                # Liveness: the process answers; no dependency checks.
+                payload = {
+                    "contract": "book-api-gateway.v1",
+                    "status": "ok",
+                    "auth_configured": auth_configured,
+                }
+                return self._send_json(200, payload, request_id)
+            # Readiness: only route traffic here when /api/* can succeed.
+            upstream_reachable = self.state.upstream_probe()
+            ready = auth_configured and upstream_reachable
             payload = {
                 "contract": "book-api-gateway.v1",
-                "status": "ok",
-                "auth_configured": bool(self.state.config.api_token),
+                "status": "ok" if ready else "not_ready",
+                "auth_configured": auth_configured,
+                "upstream_reachable": upstream_reachable,
             }
-            return self._send_json(200, payload, request_id)
+            return self._send_json(200 if ready else 503, payload, request_id)
 
         if not path.startswith("/api/") or path == "/api/":
             return self._error(404, "route not found", request_id)

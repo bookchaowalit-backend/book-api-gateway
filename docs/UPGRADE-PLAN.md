@@ -2,7 +2,8 @@
 
 ## Current state
 
-Score: 6/10 (was 5/10). A dependency-free local pilot with a schema-validated
+Score: 6.5/10 (was 6/10 after pass 1, 5/10 originally). Readiness now
+reflects upstream reachability and limiter memory is bounded. A dependency-free local pilot with a schema-validated
 contract, documented surface, ingress hardening and CI. It still uses a single
 local pilot token, has one upstream, and has no shadow-parity evidence against
 `solo-empire/infra/api/server.ts`.
@@ -21,18 +22,32 @@ local pilot token, has one upstream, and has no shadow-parity evidence against
 
 - Route table (prefix -> allow-listed upstream) instead of one
   `UPSTREAM_BASE_URL`, with a versioned route contract (registry gate).
-- Bound the rate limiter's per-subject map (evict expired windows) before more
-  than one subject exists.
-- Speed up the HTTP tests (server shutdown dominates the ~14 s suite).
+- The remaining ~4 s of the suite is `raw_exchange` sleeping for socket
+  reads; read until the response is complete instead of fixed waits.
 - Keep `schema/book-platform.contract.v1.schema.json` identical to
   `bookchaowalit-backend-core/contracts/`.
 
 ### P2
 
-- Rollback-route drill documentation and a health check that verifies upstream
-  reachability for `/readyz`.
+- Rollback-route drill documentation.
+- Cache the `/readyz` probe result for a second or two so an aggressive
+  orchestrator cannot turn readiness checks into upstream connection load.
 
-## Done in this pass
+## Done in this pass (pass 2)
+
+- `/readyz` is a real readiness check: 503 `not_ready` unless a token is
+  configured and a TCP connect to the upstream succeeds (no HTTP request, no
+  upstream address in the payload). `/healthz` stays liveness-only.
+- Rate limiter memory is bounded (`max_keys`, default 10,000): expired windows
+  are dropped first, then the oldest; eviction can only reset a count, never
+  block a request.
+- Test suite 16 s -> ~4.5 s (servers polled every 20 ms instead of 0.5 s);
+  8 new tests (readiness, probe, limiter bounds). Offline only.
+- P0 items (identity subject assertion, shadow-parity fixtures) remain blocked
+  on `book-identity-platform` and sanitized `solo-empire` captures.
+
+## Done in pass 1
+
 
 - Fixed: `/api/../x`, percent-encoded dot segments and backslashes reached the
   upstream and could escape the `/api/` prefix; now rejected with 400.
