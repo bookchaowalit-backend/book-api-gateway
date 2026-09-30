@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import json
+import os
 import socket
 import sys
 import threading
 import time
 import unittest
+from unittest import mock
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.error import HTTPError
@@ -380,6 +382,16 @@ class GatewayTests(unittest.TestCase):
             GatewayConfig(api_token=self.token, upstream_base_url="http://user:pass@127.0.0.1:9000")
         with self.assertRaises(ConfigError):
             GatewayConfig(api_token=self.token, upstream_base_url="http://example.com:9000")
+
+    def test_upstream_timeout_must_be_finite(self) -> None:
+        for raw in ("nan", "NaN", "inf", "-inf", "Infinity"):
+            with self.subTest(raw=raw):
+                with mock.patch.dict(os.environ, {"UPSTREAM_TIMEOUT_SECONDS": raw, "UPSTREAM_BASE_URL": "http://127.0.0.1:9000"}):
+                    with self.assertRaises(ConfigError):
+                        GatewayConfig.from_env()
+        for value in (float("nan"), float("inf")):
+            with self.assertRaises(ConfigError):
+                GatewayConfig(api_token=self.token, upstream_timeout_seconds=value)
 
 
 if __name__ == "__main__":

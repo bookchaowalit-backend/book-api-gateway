@@ -35,6 +35,10 @@ local pilot token, has one upstream, and has no shadow-parity evidence against
   orchestrator cannot turn readiness checks into upstream connection load.
 
 ## Done in this pass (pass 2)
+- `UPSTREAM_TIMEOUT_SECONDS=nan`/`inf` is rejected at startup. `float()`
+  accepts them and NaN passes `<= 0`, so the gateway started and then
+  failed every proxied request inside `socket.settimeout`
+  (`test_upstream_timeout_must_be_finite`).
 
 - `/readyz` is a real readiness check: 503 `not_ready` unless a token is
   configured and a TCP connect to the upstream succeeds (no HTTP request, no
