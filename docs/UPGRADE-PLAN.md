@@ -61,6 +61,14 @@ local pilot token, has one upstream, and has no shadow-parity evidence against
 - `tests/test_drift_checks.py` covers both checks offline. Verified against
   `solo-empire` `5b43c85` (no drift, no warnings) and
   `bookchaowalit-backend-core/scripts/check_platform_sync.py --require-pin`.
+- Route access matrix: `ROUTE_ACCESS` in `server.py` (`/healthz`,
+  `/readyz` public GET; `/api/*` service token, GET/POST) is what
+  `_dispatch` reads for method checks. `tests/test_route_access.py` pins it,
+  forbids public non-safe methods, and drives every route x 7 methods x
+  (anonymous, wrong token, token): 405 / 401 / 200 as classified, only GET
+  and POST reach the upstream, unclassified paths 404. Network exposure:
+  the server already binds `127.0.0.1` by default (`GATEWAY_HOST`); no
+  compose or Dockerfile in this repository.
 
 ## Done in pass 1
 

@@ -27,6 +27,19 @@ REQUEST_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
 CONTENT_LENGTH_RE = re.compile(r"[0-9]{1,19}")
 FORWARD_HEADERS = ("Accept", "Content-Type", "If-Match", "If-None-Match")
 ALLOWED_METHODS = frozenset({"GET", "POST"})
+
+# Route access matrix. "public" needs no credentials and may only serve safe
+# methods; "service" needs `Authorization: Bearer $GATEWAY_API_TOKEN`.
+# `_dispatch` reads the method sets from here and
+# tests/test_route_access.py pins every entry, so a new route class or
+# method has to be classified on purpose.
+PUBLIC = "public"
+SERVICE = "service"
+ROUTE_ACCESS: dict[str, tuple[str, frozenset[str]]] = {
+    "/healthz": (PUBLIC, frozenset({"GET"})),
+    "/readyz": (PUBLIC, frozenset({"GET"})),
+    "/api/*": (SERVICE, ALLOWED_METHODS),
+}
 TelemetrySink = Callable[[dict[str, Any]], None]
 
 
@@ -225,8 +238,11 @@ class GatewayRequestHandler(BaseHTTPRequestHandler):
             return self._error(400, "query parameters are not supported by the pilot", request_id)
 
         if path in {"/healthz", "/readyz"}:
-            if self.command != "GET":
-                return self._error(405, "method not allowed", request_id, extra_headers={"Allow": "GET"})
+            methods = ROUTE_ACCESS[path][1]
+            if self.command not in methods:
+                return self._error(
+                    405, "method not allowed", request_id, extra_headers={"Allow": ", ".join(sorted(methods))}
+                )
             auth_configured = bool(self.state.config.api_token)
             if path == "/healthz":
                 # Liveness: the process answers; no dependency checks.
@@ -251,8 +267,11 @@ class GatewayRequestHandler(BaseHTTPRequestHandler):
             return self._error(404, "route not found", request_id)
         if _unsafe_api_path(path):
             return self._error(400, "invalid request path", request_id)
-        if self.command not in ALLOWED_METHODS:
-            return self._error(405, "method not allowed", request_id, extra_headers={"Allow": "GET, POST"})
+        api_methods = ROUTE_ACCESS["/api/*"][1]
+        if self.command not in api_methods:
+            return self._error(
+                405, "method not allowed", request_id, extra_headers={"Allow": ", ".join(sorted(api_methods))}
+            )
 
         subject_hash = self._authenticate(request_id)
         if subject_hash is None:
