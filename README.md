@@ -14,7 +14,7 @@ customer payload.
 
 - Owner: `bookchaowalit-backend`
 - Repository: `book-api-gateway`
-- Target remote: `https://github.com/bookchaowalit-backend/book-api-gateway.git` (not created by the bootstrap)
+- Target remote: `https://github.com/bookchaowalit-backend/book-api-gateway.git` (published; runtime not activated)
 - Contract: `book-platform.contract.v1`
 - Status: `pilot` (local only)
 - Data owner: the platform boundary identified in `contract.json`
@@ -32,10 +32,24 @@ Run from this repository:
 bash scripts/check.sh
 ```
 
-The check validates repository shape, contract metadata, routing/authentication
-behavior, rate limiting, upstream timeout handling, and telemetry redaction.
+The check validates `contract.json` against
+[`schema/book-platform.contract.v1.schema.json`](schema/book-platform.contract.v1.schema.json),
+confirms that the README and [`API.md`](API.md) agree with the contract, and
+runs the unit tests: routing/authentication behavior, path and request-body
+hardening, rate limiting, upstream timeout handling, and telemetry redaction.
+GitHub Actions runs the same command on every push and pull request
+(`.github/workflows/check.yml`). Planned work is tracked in
+[`docs/UPGRADE-PLAN.md`](docs/UPGRADE-PLAN.md).
 It uses only loopback fixtures and does not claim deployment, provider
 connectivity, data migration, or production readiness.
+
+`scripts/check_schema_pin.py` fails when the vendored schema no longer
+matches the sha256 pinned in `schema/book-platform.contract.v1.schema.json.sha256`
+(the canonical copy lives in `bookchaowalit-backend-core/contracts/`; change it
+there first, then copy the schema and its pin here). Pass
+`--canonical ../bookchaowalit-backend-core` to also compare with a local
+checkout. `python3 scripts/check_registry_alignment.py --solo-empire ../solo-empire`
+compares this contract with the parent platform registry (local only; read-only).
 
 The pilot exposes `GET /healthz` and authenticated `GET`/`POST /api/*` routes.
 Set `BOOK_API_GATEWAY_TOKEN`, `UPSTREAM_BASE_URL`, and (when the upstream is

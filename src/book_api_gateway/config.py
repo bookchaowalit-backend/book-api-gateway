@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 from dataclasses import dataclass, field
 from urllib.parse import SplitResult, urlsplit, urlunsplit
@@ -71,7 +72,9 @@ def _env_float(name: str, default: float) -> float:
         parsed = float(value)
     except ValueError as exc:
         raise ConfigError(f"{name} must be a number") from exc
-    if parsed <= 0:
+    # float() accepts "nan" and "inf"; NaN also passes `<= 0`, and either
+    # value only fails later inside socket.settimeout on every request.
+    if not math.isfinite(parsed) or parsed <= 0:
         raise ConfigError(f"{name} must be greater than zero")
     return parsed
 
@@ -92,8 +95,12 @@ class GatewayConfig:
             raise ConfigError("BOOK_API_GATEWAY_TOKEN must be a string")
         if len(self.api_token) > 4096:
             raise ConfigError("BOOK_API_GATEWAY_TOKEN is too long")
-        if not isinstance(self.upstream_timeout_seconds, (int, float)) or self.upstream_timeout_seconds <= 0:
-            raise ConfigError("UPSTREAM_TIMEOUT_SECONDS must be greater than zero")
+        if (
+            not isinstance(self.upstream_timeout_seconds, (int, float))
+            or not math.isfinite(self.upstream_timeout_seconds)
+            or self.upstream_timeout_seconds <= 0
+        ):
+            raise ConfigError("UPSTREAM_TIMEOUT_SECONDS must be a finite number greater than zero")
         if not isinstance(self.rate_limit_per_minute, int) or self.rate_limit_per_minute <= 0:
             raise ConfigError("RATE_LIMIT_PER_MINUTE must be greater than zero")
         if not isinstance(self.max_body_bytes, int) or self.max_body_bytes <= 0:

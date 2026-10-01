@@ -1,20 +1,95 @@
 {
+  "$schema": "./schema/book-platform.contract.v1.schema.json",
   "schema_version": "book-platform.contract.v1",
   "platform_id": "api-gateway",
   "repository": "book-api-gateway",
   "status": "pilot",
   "api_version": "v1",
   "data_owner": "none",
-  "capabilities": ["routing", "request-id", "rate-limit", "ingress-policy"],
-  "depends_on": ["identity"],
+  "capabilities": [
+    "routing",
+    "request-id",
+    "rate-limit",
+    "ingress-policy"
+  ],
+  "depends_on": [
+    "identity"
+  ],
   "current_implementation": {
     "repository": "solo-empire",
-    "source_path": "infra/api/server.ts"
+    "source_path": "infra/api/server.ts",
+    "source_paths": [
+      "infra/api/server.ts",
+      "infra/api/rate_limit.ts"
+    ],
+    "source_status": "current-implementation-in-solo-empire"
   },
   "migration": {
     "compatibility_adapter": "local HTTP adapter only",
     "shadow_parity": "pending: compare infra/api/server.ts responses",
     "cutover": "pending",
     "rollback": "required"
-  }
+  },
+  "migration_gates": [
+    "versioned route contract",
+    "shadow parity",
+    "rollback route"
+  ],
+  "surface_doc": "API.md",
+  "interfaces": [
+    {
+      "id": "api-gateway.http.healthz",
+      "kind": "http",
+      "direction": "provides",
+      "name": "GET /healthz",
+      "status": "pilot",
+      "source": "src/book_api_gateway/server.py",
+      "contract": "book-api-gateway.v1",
+      "auth": "public"
+    },
+    {
+      "id": "api-gateway.http.readyz",
+      "kind": "http",
+      "direction": "provides",
+      "name": "GET /readyz",
+      "status": "pilot",
+      "source": "src/book_api_gateway/server.py",
+      "contract": "book-api-gateway.v1",
+      "auth": "public"
+    },
+    {
+      "id": "api-gateway.http.proxy",
+      "kind": "http",
+      "direction": "provides",
+      "name": "GET|POST /api/*",
+      "status": "pilot",
+      "source": "src/book_api_gateway/server.py",
+      "contract": "book-api-gateway.v1",
+      "auth": "Authorization: Bearer <configured token>"
+    },
+    {
+      "id": "api-gateway.http.upstream",
+      "kind": "http",
+      "direction": "consumes",
+      "name": "Allow-listed upstream platform API (UPSTREAM_BASE_URL)",
+      "status": "pilot",
+      "source": "src/book_api_gateway/server.py"
+    },
+    {
+      "id": "api-gateway.event.request-completed",
+      "kind": "event",
+      "direction": "provides",
+      "name": "request.completed redacted telemetry event",
+      "status": "pilot",
+      "source": "src/book_api_gateway/server.py"
+    },
+    {
+      "id": "api-gateway.consumes.identity",
+      "kind": "http",
+      "direction": "consumes",
+      "name": "Identity subject assertion (planned replacement for the pilot token)",
+      "status": "planned",
+      "source": "none"
+    }
+  ]
 }

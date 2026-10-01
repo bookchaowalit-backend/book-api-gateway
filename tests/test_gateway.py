@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import json
+import os
+import socket
 import sys
 import threading
 import time
 import unittest
+from unittest import mock
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.error import HTTPError
@@ -15,7 +18,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from book_api_gateway.config import ConfigError, GatewayConfig  # noqa: E402
-from book_api_gateway.server import create_server  # noqa: E402
+from book_api_gateway.limiter import FixedWindowRateLimiter  # noqa: E402
+from book_api_gateway.server import create_server, upstream_tcp_probe  # noqa: E402
 
 
 class RecordingUpstreamHandler(BaseHTTPRequestHandler):
@@ -76,7 +80,9 @@ class RecordingUpstreamHandler(BaseHTTPRequestHandler):
 
 
 def start_server(server: ThreadingHTTPServer) -> threading.Thread:
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    # A short poll interval keeps shutdown() fast; the default 0.5 s poll made
+    # teardown dominate the suite.
+    thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.02}, daemon=True)
     thread.start()
     return thread
 
@@ -91,6 +97,25 @@ def call(url: str, *, method: str = "GET", headers: dict[str, str] | None = None
             return error.code, dict(error.headers), json.loads(error.read().decode("utf-8"))
         finally:
             error.close()
+
+
+def raw_exchange(port: int, payload: bytes, *, wait: float = 0.3) -> bytes:
+    """Send raw bytes on one connection and return everything the gateway writes."""
+
+    with socket.create_connection(("127.0.0.1", port), timeout=1.0) as connection:
+        connection.sendall(payload)
+        time.sleep(wait)
+        connection.settimeout(0.5)
+        chunks: list[bytes] = []
+        try:
+            while True:
+                chunk = connection.recv(65536)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+        except socket.timeout:
+            pass
+    return b"".join(chunks)
 
 
 class GatewayTests(unittest.TestCase):
@@ -121,6 +146,40 @@ class GatewayTests(unittest.TestCase):
         self.gateway = create_server(config, telemetry_sink=self.telemetry.append)
         start_server(self.gateway)
         return f"http://127.0.0.1:{self.gateway.server_port}"
+
+    def test_readyz_reports_ready_when_upstream_reachable(self) -> None:
+        base_url = self.start_gateway()
+        status, _headers, payload = call(f"{base_url}/readyz")
+
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["status"], "ok")
+        self.assertTrue(payload["upstream_reachable"])
+        self.assertEqual(RecordingUpstreamHandler.records, [], "readiness must not send upstream HTTP requests")
+
+    def test_readyz_is_503_when_upstream_down_but_healthz_stays_200(self) -> None:
+        base_url = self.start_gateway()
+        self.upstream.shutdown()
+        self.upstream.server_close()
+
+        status, _headers, payload = call(f"{base_url}/readyz")
+        self.assertEqual(status, 503)
+        self.assertEqual(payload["status"], "not_ready")
+        self.assertFalse(payload["upstream_reachable"])
+        self.assertNotIn("127.0.0.1", json.dumps(payload), "upstream address must not be disclosed")
+
+        health_status, _headers, _payload = call(f"{base_url}/healthz")
+        self.assertEqual(health_status, 200)
+
+    def test_readyz_is_503_without_token(self) -> None:
+        config = GatewayConfig(
+            api_token="",
+            upstream_base_url=f"http://127.0.0.1:{self.upstream.server_port}",
+        )
+        self.gateway = create_server(config, telemetry_sink=self.telemetry.append)
+        start_server(self.gateway)
+        status, _headers, payload = call(f"http://127.0.0.1:{self.gateway.server_port}/readyz")
+        self.assertEqual(status, 503)
+        self.assertFalse(payload["auth_configured"])
 
     def test_health_is_public_and_sets_request_id(self) -> None:
         base_url = self.start_gateway()
@@ -230,6 +289,11 @@ class GatewayTests(unittest.TestCase):
         )
 
         self.assertEqual(status, 200)
+        # Telemetry is emitted after the response is flushed, so the client can
+        # observe the response first; wait briefly instead of racing the handler.
+        deadline = time.monotonic() + 2.0
+        while not self.telemetry and time.monotonic() < deadline:
+            time.sleep(0.01)
         self.assertTrue(self.telemetry)
         event = self.telemetry[-1]
         self.assertEqual(event["event"], "request.completed")
@@ -240,12 +304,136 @@ class GatewayTests(unittest.TestCase):
         self.assertNotIn(self.token, rendered)
         self.assertNotIn(body.decode(), rendered)
 
+    def test_dot_segments_and_backslashes_cannot_escape_the_api_prefix(self) -> None:
+        self.start_gateway()
+        port = self.gateway.server_port
+        for target in ("/api/../admin", "/api/demo/%2e%2e/%2E%2E/admin", "/api/./demo", "/api/demo\\..\\admin", "/api/demo%5c..%5cadmin"):
+            with self.subTest(target=target):
+                response = raw_exchange(
+                    port,
+                    f"GET {target} HTTP/1.1\r\nHost: gateway\r\nAuthorization: Bearer {self.token}\r\nConnection: close\r\n\r\n".encode(),
+                )
+                self.assertTrue(response.startswith(b"HTTP/1.1 400 "), response[:80])
+                self.assertIn(b"invalid request path", response)
+        self.assertEqual(RecordingUpstreamHandler.records, [])
+
+    def test_rejected_request_body_is_not_parsed_as_a_second_request(self) -> None:
+        self.start_gateway()
+        smuggled = b"GET /healthz HTTP/1.1\r\nHost: gateway\r\n\r\n"
+        response = raw_exchange(
+            self.gateway.server_port,
+            b"POST /api/demo HTTP/1.1\r\nHost: gateway\r\nContent-Length: "
+            + str(len(smuggled)).encode()
+            + b"\r\n\r\n"
+            + smuggled,
+        )
+
+        self.assertEqual(response.count(b"HTTP/1.1 "), 1, response)
+        self.assertTrue(response.startswith(b"HTTP/1.1 401 "))
+        self.assertIn(b"Connection: close", response)
+
+    def test_chunked_request_bodies_are_rejected_without_proxying(self) -> None:
+        self.start_gateway()
+        response = raw_exchange(
+            self.gateway.server_port,
+            (
+                "POST /api/demo HTTP/1.1\r\nHost: gateway\r\n"
+                f"Authorization: Bearer {self.token}\r\nTransfer-Encoding: chunked\r\n\r\n"
+                "5\r\nhello\r\n0\r\n\r\n"
+            ).encode(),
+        )
+
+        self.assertEqual(response.count(b"HTTP/1.1 "), 1, response)
+        self.assertTrue(response.startswith(b"HTTP/1.1 411 "))
+        self.assertEqual(RecordingUpstreamHandler.records, [])
+
+    def test_ambiguous_content_length_is_rejected(self) -> None:
+        self.start_gateway()
+        for headers in ("Content-Length: 1\r\nContent-Length: 2\r\n", "Content-Length: +1\r\n"):
+            with self.subTest(headers=headers):
+                response = raw_exchange(
+                    self.gateway.server_port,
+                    (
+                        "POST /api/demo HTTP/1.1\r\nHost: gateway\r\n"
+                        f"Authorization: Bearer {self.token}\r\n{headers}\r\nxx"
+                    ).encode(),
+                )
+                self.assertTrue(response.startswith(b"HTTP/1.1 400 "), response[:80])
+                self.assertIn(b"invalid content length", response)
+        self.assertEqual(RecordingUpstreamHandler.records, [])
+
+    def test_successful_requests_keep_the_connection_reusable(self) -> None:
+        self.start_gateway()
+        request = f"GET /api/demo HTTP/1.1\r\nHost: gateway\r\nAuthorization: Bearer {self.token}\r\n\r\n".encode()
+        response = raw_exchange(self.gateway.server_port, request + request)
+
+        self.assertEqual(response.count(b"HTTP/1.1 200 "), 2, response)
+        self.assertEqual(len(RecordingUpstreamHandler.records), 2)
+
+    def test_server_header_does_not_disclose_runtime_version(self) -> None:
+        base_url = self.start_gateway()
+        _status, headers, _payload = call(f"{base_url}/healthz")
+
+        self.assertEqual(headers["Server"], "book-api-gateway")
+        self.assertNotIn("Python", json.dumps(headers))
+
     def test_upstream_base_url_rejects_credentials_and_non_allowlisted_hosts(self) -> None:
         with self.assertRaises(ConfigError):
             GatewayConfig(api_token=self.token, upstream_base_url="http://user:pass@127.0.0.1:9000")
         with self.assertRaises(ConfigError):
             GatewayConfig(api_token=self.token, upstream_base_url="http://example.com:9000")
 
+    def test_upstream_timeout_must_be_finite(self) -> None:
+        for raw in ("nan", "NaN", "inf", "-inf", "Infinity"):
+            with self.subTest(raw=raw):
+                with mock.patch.dict(os.environ, {"UPSTREAM_TIMEOUT_SECONDS": raw, "UPSTREAM_BASE_URL": "http://127.0.0.1:9000"}):
+                    with self.assertRaises(ConfigError):
+                        GatewayConfig.from_env()
+        for value in (float("nan"), float("inf")):
+            with self.assertRaises(ConfigError):
+                GatewayConfig(api_token=self.token, upstream_timeout_seconds=value)
+
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class UpstreamProbeTests(unittest.TestCase):
+    def test_closed_port_is_unreachable(self) -> None:
+        with socket.socket() as sock:
+            sock.bind(("127.0.0.1", 0))
+            port = sock.getsockname()[1]
+        self.assertFalse(upstream_tcp_probe(f"http://127.0.0.1:{port}", 0.2))
+
+    def test_listening_port_is_reachable(self) -> None:
+        with socket.socket() as sock:
+            sock.bind(("127.0.0.1", 0))
+            sock.listen()
+            self.assertTrue(upstream_tcp_probe(f"http://127.0.0.1:{sock.getsockname()[1]}", 0.2))
+
+
+class LimiterBoundTests(unittest.TestCase):
+    def test_expired_windows_are_evicted(self) -> None:
+        now = [0.0]
+        limiter = FixedWindowRateLimiter(1, window_seconds=10, clock=lambda: now[0], max_keys=3)
+        for key in ("a", "b", "c"):
+            limiter.allow(key)
+        now[0] = 11.0
+        limiter.allow("d")
+        self.assertEqual(len(limiter), 1)
+
+    def test_active_windows_are_capped_oldest_first(self) -> None:
+        now = [0.0]
+        limiter = FixedWindowRateLimiter(1, window_seconds=60, clock=lambda: now[0], max_keys=2)
+        for key in ("a", "b", "c"):
+            now[0] += 1
+            self.assertTrue(limiter.allow(key)[0])
+        self.assertEqual(len(limiter), 2)
+        # "a" was evicted, so its count restarts; "c" is still limited.
+        self.assertTrue(limiter.allow("a")[0])
+        self.assertFalse(limiter.allow("c")[0])
+
+    def test_rejects_non_positive_bound(self) -> None:
+        with self.assertRaises(ValueError):
+            FixedWindowRateLimiter(1, max_keys=0)
+
